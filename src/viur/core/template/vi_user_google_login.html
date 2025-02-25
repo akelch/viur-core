@@ -1,0 +1,32 @@
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Google Login</title>
+    <script>
+		function onSignIn(googleUser) {
+			var xmlhttp = new XMLHttpRequest();
+			xmlhttp.onreadystatechange = function () {
+				if (xmlhttp.readyState === XMLHttpRequest.DONE) {
+					if (xmlhttp.status === 200) {
+						console.log(xmlhttp.responseText);
+						var skey = xmlhttp.responseText.substring(1, xmlhttp.responseText.length-1);
+						window.location.href = "/vi/user/auth_googleaccount/login?skey="+skey+"&token="+googleUser.credential;
+						//document.getElementById("myDiv").innerHTML = xmlhttp.responseText;
+					} else {
+						alert('Failed to fetch skey');
+					}
+				}
+			};
+			xmlhttp.open("GET", "/vi/skey", true);
+			xmlhttp.withCredentials = true;
+			xmlhttp.send();
+		}
+	</script>
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body>
+<div id="g_id_onload" data-client_id="{{ clientID }}" data-callback="onSignIn" data-ux_mode="popup"
+     data-auto_prompt="false"></div>
+<div class="g_id_signin" data-type="standard"></div>
+</body>
+</html>
