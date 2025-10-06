@@ -7,7 +7,8 @@ import warnings
 from numbers import Number
 
 from viur.core import current, db, utils
-from viur.core.bones.base import BaseBone, ReadFromClientError, ReadFromClientErrorSeverity
+from .base import ReadFromClientError, ReadFromClientErrorSeverity
+from .raw import RawBone
 
 if t.TYPE_CHECKING:
     from ..skeleton import SkeletonInstance
@@ -15,7 +16,7 @@ if t.TYPE_CHECKING:
 DB_TYPE_INDEXED: t.TypeAlias = dict[t.Literal["val", "idx", "sort_idx"], str]
 
 
-class StringBone(BaseBone):
+class StringBone(RawBone):
     """
     The "StringBone" represents a data field that contains text values.
     """
@@ -284,24 +285,6 @@ class StringBone(BaseBone):
             "ẞ": "SS",
         }))
 
-    def getSearchTags(self, skel: "SkeletonInstance", name: str) -> set[str]:
-        """
-        Returns a set of lowercased words that represent searchable tags for the given bone.
-
-        :param skel: The skeleton instance being searched.
-        :param name: The name of the bone to generate tags for.
-
-        :return: A set of lowercased words representing searchable tags.
-        """
-        result = set()
-        for idx, lang, value in self.iter_bone_value(skel, name):
-            if value is None:
-                continue
-            for line in str(value).splitlines():  # TODO: Can a StringBone be multiline?
-                for word in line.split(" "):
-                    result.add(word.lower())
-        return result
-
     def getUniquePropertyIndexValues(self, skel: "SkeletonInstance", name: str) -> list[str]:
         """
         Returns a list of unique index values for a given property name.
@@ -331,7 +314,12 @@ class StringBone(BaseBone):
         # TODO: duplicate code, this is the same iteration logic as in NumericBone
         new_value = {}
         for _, lang, value in self.iter_bone_value(skel, bone_name):
-            new_value.setdefault(lang, []).append(self.type_coerce_single_value(value))
+            value = self.type_coerce_single_value(value)
+            if self.escape_html:
+                value = utils.string.escape(value)
+            else:
+                value = utils.string.unescape(value)
+            new_value.setdefault(lang, []).append(value)
 
         if not self.multiple:
             # take the first one

@@ -1,11 +1,9 @@
 import abc
 import datetime
 import functools
-import json
 import logging
 import os
 import sys
-import time
 import traceback
 import typing as t
 
@@ -197,7 +195,8 @@ class TaskHandler(Module):
 
         cmd, data = utils.json.loads(req.body)
         funcPath, args, kwargs, env = data
-        logging.debug(f"Call task {funcPath} with {cmd=} {args=} {kwargs=} {env=}")
+        if conf.debug.trace:
+            logging.debug(f"Call task {funcPath} with {cmd=} {args=} {kwargs=} {env=}")
 
         if env:
             if "user" in env and env["user"]:
@@ -212,7 +211,7 @@ class TaskHandler(Module):
             if "lang" in env and env["lang"]:
                 current.language.set(env["lang"])
             if "transactionMarker" in env:
-                marker = db.Get(db.Key("viur-transactionmarker", env["transactionMarker"]))
+                marker = db.get(db.Key("viur-transactionmarker", env["transactionMarker"]))
                 if not marker:
                     logging.info(f"""Dropping task, transaction {env["transactionMarker"]} did not apply""")
                     return
@@ -264,7 +263,7 @@ class TaskHandler(Module):
         for task, interval in _periodicTasks[cronName].items():  # Call all periodic tasks bound to that queue
             periodicTaskName = task.periodicTaskName.lower()
             if interval:  # Ensure this task doesn't get called to often
-                lastCall = db.Get(db.Key("viur-task-interval", periodicTaskName))
+                lastCall = db.get(db.Key("viur-task-interval", periodicTaskName))
                 if lastCall and utils.utcNow() - lastCall["date"] < interval:
                     logging.debug(f"Task {periodicTaskName!r} has already run recently - skipping.")
                     continue
@@ -283,23 +282,8 @@ class TaskHandler(Module):
                 # Update its last-call timestamp
                 entry = db.Entity(db.Key("viur-task-interval", periodicTaskName))
                 entry["date"] = utils.utcNow()
-                db.Put(entry)
+                db.put(entry)
         logging.debug("Periodic tasks complete")
-        for currentTask in db.Query("viur-queued-tasks").iter():  # Look for queued tasks
-            db.Delete(currentTask.key())
-            if currentTask["taskid"] in _callableTasks:
-                task = _callableTasks[currentTask["taskid"]]()
-                tmpDict = {}
-                for k in currentTask.keys():
-                    if k == "taskid":
-                        continue
-                    tmpDict[k] = json.loads(currentTask[k])
-                try:
-                    task.execute(**tmpDict)
-                except Exception as e:
-                    logging.error("Error executing Task")
-                    logging.exception(e)
-        logging.debug("Scheduled tasks complete")
 
     def _validate_request(
         self,
@@ -335,31 +319,48 @@ class TaskHandler(Module):
         """Lists all user-callable tasks which are callable by this user"""
         global _callableTasks
 
-        tasks = db.SkelListRef()
-        tasks.extend([{
-            "key": x.key,
-            "name": str(x.name),
-            "descr": str(x.descr)
-        } for x in _callableTasks.values() if x().canCall()
-        ])
+        from viur.core.skeleton import SkeletonInstance, SkelList, RelSkel
+        from viur.core.bones import BaseBone, StringBone
+
+        class TaskSkel(RelSkel):
+            key = BaseBone()
+            name = StringBone()
+            descr = StringBone()
+
+        tasks = SkelList(TaskSkel, *(
+            SkeletonInstance(TaskSkel, {
+                "key": task.key,
+                "name": str(task.name),
+                "descr": str(task.descr)
+            }) for task in _callableTasks.values() if task().canCall()
+        ))
 
         return self.render.list(tasks)
 
     @exposed
     @skey(allow_empty=True)
-    def execute(self, taskID, *args, **kwargs):
+    def execute(self, taskID, *, bounce: bool = False, **kwargs):
         """Queues a specific task for the next maintenance run"""
         global _callableTasks
+
         if taskID in _callableTasks:
             task = _callableTasks[taskID]()
         else:
             return
+
         if not task.canCall():
             raise errors.Unauthorized()
+
         skel = task.dataSkel()
-        if not kwargs or not skel.fromClient(kwargs) or utils.parse.bool(kwargs.get("bounce")):
+        if (
+            not kwargs
+            or not skel.fromClient(kwargs)
+            or bounce
+        ):
             return self.render.add(skel)
+
         task.execute(**skel.accessedValues)
+
         return self.render.addSuccess(skel)
 
 
@@ -456,7 +457,9 @@ def CallDeferred(func: t.Callable) -> t.Callable:
     In addition to the arguments for the wrapped methods you can set these:
 
     _queue: Specify the queue in which the task should be pushed.
-        "default" is the default value. The queue must exist (use the queue.yaml).
+        If no value is given, the queue name set in `conf.tasks_default_queues`
+        will be used. If the config does not have a value for this task, "default"
+        is used as the default. The queue must exist (use the queue.yaml).
 
     _countdown: Specify a time in seconds after which the task should be called.
         This time is relative to the moment where the wrapped method has been called.
@@ -500,7 +503,7 @@ def CallDeferred(func: t.Callable) -> t.Callable:
         func: t.Callable,
         self=__undefinedFlag_,
         *args,
-        _queue: str = "default",
+        _queue: str = None,
         _name: str | None = None,
         _call_deferred: bool = True,
         _target_version: str = conf.instance.app_version,
@@ -510,11 +513,11 @@ def CallDeferred(func: t.Callable) -> t.Callable:
     ):
         if _eta is not None and _countdown:
             raise ValueError("You cannot set the _countdown and _eta argument together!")
-
-        logging.debug(
-            f"make_deferred {func=}, {self=}, {args=}, {kwargs=}, "
-            f"{_queue=}, {_name=}, {_call_deferred=}, {_target_version=}, {_eta=}, {_countdown=}"
-        )
+        if conf.debug.trace:
+            logging.debug(
+                f"make_deferred {func=}, {self=}, {args=}, {kwargs=}, "
+                f"{_queue=}, {_name=}, {_call_deferred=}, {_target_version=}, {_eta=}, {_countdown=}"
+            )
 
         try:
             req = current.request.get()
@@ -564,6 +567,11 @@ def CallDeferred(func: t.Callable) -> t.Callable:
                     args = (self,) + args  # Re-append self to args, as this function is (hopefully) unbound
                 command = "unb"
 
+            if _queue is None:
+                _queue = conf.tasks_default_queues.get(
+                    funcPath, conf.tasks_default_queues.get("__default__", "default")
+                )
+
             # Try to preserve the important data from the current environment
             try:  # We might get called inside a warmup request without session
                 usr = current.session.get().get("user")
@@ -579,9 +587,9 @@ def CallDeferred(func: t.Callable) -> t.Callable:
             except AttributeError:  # This isn't originating from a normal request
                 pass
 
-            if db.IsInTransaction():
+            if db.is_in_transaction():
                 # We have to ensure transaction guarantees for that task also
-                env["transactionMarker"] = db.acquireTransactionSuccessMarker()
+                env["transactionMarker"] = db.acquire_transaction_success_marker()
                 # We move that task at least 90 seconds into the future so the transaction has time to settle
                 _countdown = max(90, _countdown)  # Countdown can be set to None
 
@@ -654,6 +662,7 @@ def PeriodicTask(interval: datetime.timedelta | int | float = 0, cronName: str =
 
         :param interval: Call at most the given timedelta.
     """
+
     def make_decorator(fn):
         nonlocal interval
         if fn.__name__.startswith("_"):
@@ -749,7 +758,7 @@ class QueryIter(object, metaclass=MetaQueryIter):
         assert isinstance(query.queries, db.QueryDefinition), "Unsatisfiable query or query with an IN filter"
         qryDict = {
             "kind": query.kind,
-            "srcSkel": query.srcSkel.kindName if query.srcSkel else None,
+            "srcSkel": query.srcSkel.kindName if query.srcSkel is not None else None,
             "filters": query.queries.filters,
             "orders": [(propName, sortOrder.value) for propName, sortOrder in query.queries.orders],
             "startCursor": query.queries.startCursor,
@@ -795,6 +804,7 @@ class QueryIter(object, metaclass=MetaQueryIter):
             reschedules the next block.
         """
         from viur.core.skeleton import skeletonByKind
+
         qry = db.Query(qryDict["kind"])
         qry.srcSkel = skeletonByKind(qryDict["srcSkel"])() if qryDict["srcSkel"] else None
         qry.queries.filters = qryDict["filters"]
@@ -802,15 +812,17 @@ class QueryIter(object, metaclass=MetaQueryIter):
         qry.setCursor(qryDict["startCursor"], qryDict["endCursor"])
         qry.origKind = qryDict["origKind"]
         qry.queries.distinct = qryDict["distinct"]
-        if qry.srcSkel:
+
+        if qry.srcSkel is not None:
             qryIter = qry.fetch(5)
         else:
             qryIter = qry.run(5)
+
         for item in qryIter:
             try:
                 cls.handleEntry(item, qryDict["customData"])
-            except:  # First exception - we'll try another time (probably/hopefully transaction collision)
-                time.sleep(5)
+            except Exception as exception:
+                logging.error(f"{exception=}")
                 try:
                     cls.handleEntry(item, qryDict["customData"])
                 except Exception as e:  # Second exception - call error_handler
@@ -820,11 +832,15 @@ class QueryIter(object, metaclass=MetaQueryIter):
                         logging.error(f"handleError failed on {item} - bailing out")
                         logging.exception(e)
                         doCont = False
+
                     if not doCont:
                         logging.error(f"Exiting queryIter on cursor {qry.getCursor()!r}")
                         return
+
             qryDict["totalCount"] += 1
+
         cursor = qry.getCursor()
+
         if cursor:
             qryDict["startCursor"] = cursor
             cls._requeueStep(qryDict)
@@ -876,4 +892,16 @@ class DeleteEntitiesIter(QueryIter):
         if isinstance(entry, SkeletonInstance):
             entry.delete()
         else:
-            db.Delete(entry.key)
+            db.delete(entry.key)
+
+
+@PeriodicTask(interval=datetime.timedelta(hours=4))
+def start_clear_transaction_marker():
+    """
+        Removes old (expired) Transaction marker
+        https://cloud.google.com/datastore/docs/concepts/transactions?hl=en#using_transactions
+        https://cloud.google.com/tasks/docs/quotas?hl=en
+    """
+    query = db.Query("viur-transactionmarker").filter("creationdate <",
+                                                      datetime.datetime.now() - datetime.timedelta(days=31))
+    DeleteEntitiesIter.startIterOnQuery(query)

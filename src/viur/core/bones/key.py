@@ -1,7 +1,7 @@
 import copy
 import logging
 import typing as t
-from viur.core import db
+from viur.core import db, i18n
 from viur.core.bones.base import BaseBone, ReadFromClientError, ReadFromClientErrorSeverity
 
 
@@ -41,21 +41,18 @@ class KeyBone(BaseBone):
 
         if self.allowed_kinds:
             try:
-                key = db.keyHelper(value, self.allowed_kinds[0], self.allowed_kinds[1:])
+                key = db.key_helper(value, self.allowed_kinds[0], self.allowed_kinds[1:])
             except ValueError as e:
                 return self.getEmptyValue(), [ReadFromClientError(ReadFromClientErrorSeverity.Invalid, e.args[0])]
         else:
             try:
-                if isinstance(value, db.Key):
-                    key = db.normalizeKey(value)
-                else:
-                    key = db.normalizeKey(db.Key.from_legacy_urlsafe(value))
+                key = db.normalize_key(value)
             except Exception as exc:
                 logging.exception(f"Failed to normalize {value}: {exc}")
                 return self.getEmptyValue(), [
                     ReadFromClientError(
                         ReadFromClientErrorSeverity.Invalid,
-                        "The provided key is not a valid database key"
+                        i18n.translate("core.bones.error.invalidkey", "No valid database key could be parsed")
                     )
                 ]
 
@@ -65,11 +62,11 @@ class KeyBone(BaseBone):
                 return self.getEmptyValue(), [ReadFromClientError(ReadFromClientErrorSeverity.Invalid, err)]
 
             if self.check:
-                if db.Get(key) is None:
+                if db.get(key) is None:
                     return self.getEmptyValue(), [
                         ReadFromClientError(
                             ReadFromClientErrorSeverity.Invalid,
-                            "The provided key does not exist"
+                            i18n.translate("core.bones.error.keynotfound", "The provided database key does not exist")
                         )
                     ]
 
@@ -79,7 +76,7 @@ class KeyBone(BaseBone):
         if not val:
             rval = None
         elif isinstance(val, db.Key):
-            rval = db.normalizeKey(val)
+            rval = db.normalize_key(val)
         else:
             rval, err = self.singleValueFromClient(val, parse_only=True)
             if err:
@@ -176,3 +173,9 @@ class KeyBone(BaseBone):
                 except:  # Invalid key or something
                     raise RuntimeError()
             return dbFilter
+
+    def _atomic_dump(self, value):
+        if not value:
+            return None
+
+        return str(value)

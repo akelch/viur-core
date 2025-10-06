@@ -1,9 +1,10 @@
+import time
 import logging
 import typing as t
 from deprecated.sphinx import deprecated
-from viur.core import utils, errors, db, current
+from viur.core import errors, db, current
 from viur.core.decorators import *
-from viur.core.bones import KeyBone, SortIndexBone
+from viur.core.bones import KeyBone, SortIndexBone, BooleanBone
 from viur.core.cache import flushCache
 from viur.core.skeleton import Skeleton, SkeletonInstance
 from viur.core.tasks import CallDeferred
@@ -31,12 +32,17 @@ class TreeSkel(Skeleton):
         readOnly=True,
     )
 
+    is_root_node = BooleanBone(
+        defaultValue=False,
+        readOnly=True,
+        visible=False,
+    )
+
     @classmethod
     def refresh(cls, skelValues):  # ViUR2 Compatibility
         super().refresh(skelValues)
         if not skelValues["parententry"] and skelValues.dbEntity.get("parentdir"):  # parentdir for viur2 compatibility
-            skelValues["parententry"] = utils.normalizeKey(
-                db.Key.from_legacy_urlsafe(skelValues.dbEntity["parentdir"]))
+            skelValues["parententry"] = db.normalize_key(skelValues.dbEntity["parentdir"])
 
 
 class Tree(SkelModule):
@@ -161,7 +167,7 @@ class Tree(SkelModule):
         skel = self.baseSkel("node")
 
         skel["key"] = db.Key(skel.kindName, identifier)
-        skel["rootNode"] = True
+        skel["is_root_node"] = True
 
         if ensure not in (False, None):
             return skel.read(create=ensure)
@@ -243,21 +249,21 @@ class Tree(SkelModule):
             return
 
         def fixTxn(nodeKey, newRepoKey):
-            node = db.Get(nodeKey)
+            node = db.get(nodeKey)
             node["parentrepo"] = newRepoKey
-            db.Put(node)
+            db.put(node)
 
         # Fix all nodes
         q = db.Query(self.viewSkel("node").kindName).filter("parententry =", parentNode)
         for repo in q.iter():
             self.updateParentRepo(repo.key, newRepoKey, depth=depth + 1)
-            db.RunInTransaction(fixTxn, repo.key, newRepoKey)
+            db.run_in_transaction(fixTxn, repo.key, newRepoKey)
 
         # Fix the leafs on this level
         if self.leafSkelCls:
             q = db.Query(self.viewSkel("leaf").kindName).filter("parententry =", parentNode)
             for repo in q.iter():
-                db.RunInTransaction(fixTxn, repo.key, newRepoKey)
+                db.run_in_transaction(fixTxn, repo.key, newRepoKey)
 
     ## Internal exposed functions
 
@@ -410,7 +416,8 @@ class Tree(SkelModule):
     @exposed
     @force_ssl
     @skey(allow_empty=True)
-    def add(self, skelType: SkelType, node: db.Key | int | str, *args, **kwargs) -> t.Any:
+    def add(self, skelType: SkelType, node: db.Key | int | str, *, bounce: bool = False, **kwargs) -> t.Any:
+        # FIXME: VIUR4 rename node into key...
         """
         Add a new entry with the given parent *node*, and render the entry, eventually with error notes
         on incorrect data. Data is taken by any other arguments in *kwargs*.
@@ -448,8 +455,8 @@ class Tree(SkelModule):
         if (
             not kwargs  # no data supplied
             or not current.request.get().isPostRequest  # failure if not using POST-method
-            or not skel.fromClient(kwargs)  # failure on reading into the bones
-            or utils.parse.bool(kwargs.get("bounce"))  # review before adding
+            or not skel.fromClient(kwargs, amend=bounce)  # failure on reading into the bones
+            or bounce  # review before adding
         ):
             return self.render.add(skel)
 
@@ -474,13 +481,19 @@ class Tree(SkelModule):
 
         kind_name = self.nodeSkelCls.kindName if skelType == "node" else self.leafSkelCls.kindName
 
-        db_key = db.keyHelper(key, targetKind=kind_name, adjust_kind=kind_name)
-        is_add = not bool(db.Get(db_key))
+        # Adjust key
+        db_key = db.key_helper(key, target_kind=kind_name, adjust_kind=True)
 
+        # Retrieve and verify existing entry
+        db_entity = db.get(db_key)
+        is_add = not bool(db_entity)
+
+        # Instanciate relevant skeleton
         if is_add:
             skel = self.addSkel(skelType)
         else:
             skel = self.editSkel(skelType)
+            skel.dbEntity = db_entity  # assign existing entity
 
         skel = skel.ensure_is_cloned()
         skel.parententry.required = True
@@ -523,7 +536,7 @@ class Tree(SkelModule):
     @exposed
     @force_ssl
     @skey(allow_empty=True)
-    def edit(self, skelType: SkelType, key: db.Key | int | str, *args, **kwargs) -> t.Any:
+    def edit(self, skelType: SkelType, key: db.Key | int | str, *, bounce: bool = False, **kwargs) -> t.Any:
         """
         Modify an existing entry, and render the entry, eventually with error notes on incorrect data.
         Data is taken by any other arguments in *kwargs*.
@@ -556,7 +569,7 @@ class Tree(SkelModule):
             not kwargs  # no data supplied
             or not current.request.get().isPostRequest  # failure if not using POST-method
             or not skel.fromClient(kwargs, amend=True)  # failure on reading into the bones
-            or utils.parse.bool(kwargs.get("bounce"))  # review before adding
+            or bounce  # review before adding
         ):
             return self.render.edit(skel)
 
@@ -570,7 +583,7 @@ class Tree(SkelModule):
     @force_ssl
     @force_post
     @skey
-    def delete(self, skelType: SkelType, key: str, *args, **kwargs) -> t.Any:
+    def delete(self, skelType: SkelType, key: str, **kwargs) -> t.Any:
         """
         Deletes an entry or an directory (including its contents).
 
@@ -615,7 +628,7 @@ class Tree(SkelModule):
 
         :param parentKey: URL-safe key of the node which children should be deleted.
         """
-        nodeKey = db.keyHelper(parentKey, self.viewSkel("node").kindName)
+        nodeKey = db.key_helper(parentKey, self.viewSkel("node").kindName)
         if self.leafSkelCls:
             for leaf in db.Query(self.viewSkel("leaf").kindName).filter("parententry =", nodeKey).iter():
                 leafSkel = self.viewSkel("leaf")
@@ -633,7 +646,13 @@ class Tree(SkelModule):
     @force_ssl
     @force_post
     @skey
-    def move(self, skelType: SkelType, key: db.Key | int | str, parentNode: str, *args, **kwargs) -> str:
+    def move(
+        self,
+        skelType: SkelType,
+        key: db.Key | int | str,
+        parentNode: db.Key | int | str,
+        sortindex: t.Optional[float] = None
+    ) -> str:
         """
         Move a node (including its contents) or a leaf to another node.
 
@@ -642,7 +661,7 @@ class Tree(SkelModule):
         :param skelType: Defines the type of the entry that should be moved and may either be "node" or "leaf".
         :param key: URL-safe key of the item to be moved.
         :param parentNode: URL-safe key of the destination node, which must be a node.
-        :param skey: The CSRF security key.
+        :param sortindex: An optional sortindex for the key.
 
         :returns: The rendered, edited object of the entry.
 
@@ -651,70 +670,65 @@ class Tree(SkelModule):
         :raises: :exc:`viur.core.errors.PreconditionFailed`, if the *skey* could not be verified.
         """
         if not (skelType := self._checkSkelType(skelType)):
-            raise errors.NotAcceptable(f"Invalid skelType provided.")
+            raise errors.NotAcceptable("Invalid skelType provided.")
 
-        skel = self.editSkel(skelType)  # srcSkel - the skeleton to be moved
-        parentNodeSkel = self.baseSkel("node")  # destSkel - the node it should be moved into
+        skel = self.editSkel(skelType)
+        parentnode_skel = self.baseSkel("node")
 
         if not skel.read(key):
             raise errors.NotFound("Cannot find entity to move")
 
-        if not parentNodeSkel.read(parentNode):
-            parentNode = utils.normalizeKey(db.Key.from_legacy_urlsafe(parentNode))
+        if not parentnode_skel.read(parentNode):
+            parentNode = db.normalize_key(parentNode)
 
-            if parentNode.kind != parentNodeSkel.kindName:
+            if parentNode.kind != parentnode_skel.kindName:
                 raise errors.NotFound(
-                    f"You provided a key of kind {parentNode.kind}, but require a {parentNodeSkel.kindName}."
+                    f"You provided a key of kind {parentNode.kind}, but require a {parentnode_skel.kindName}."
                 )
 
             raise errors.NotFound("Cannot find parentNode entity")
 
-        if not self.canMove(skelType, skel, parentNodeSkel):
-            raise errors.Unauthorized()
-
-        if skel["key"] == parentNodeSkel["key"]:
+        if skel["key"] == parentnode_skel["key"]:
             raise errors.NotAcceptable("Cannot move a node into itself")
 
-        ## Test for recursion
-        currLevel = db.Get(parentNodeSkel["key"])
-        for _ in range(0, 99):
-            if currLevel.key == skel["key"]:
-                break
-            if currLevel.get("rootNode") or currLevel.get("is_root_node"):
-                # We reached a rootNode, so this is okay
-                break
-            currLevel = db.Get(currLevel["parententry"])
-        else:  # We did not "break" - recursion-level exceeded or loop detected
-            raise errors.NotAcceptable("Unable to find a root node in recursion?")
-
         # Test if we try to move a rootNode
-        # TODO: Remove "rootNode"-fallback with VIUR4
-        if skel.dbEntity.get("is_root_node") or skel.dbEntity.get("rootNode"):
+        if not skel["parententry"]:
             raise errors.NotAcceptable("Can't move a rootNode to somewhere else")
 
-        currentParentRepo = skel["parentrepo"]
-        skel["parententry"] = parentNodeSkel["key"]
-        skel["parentrepo"] = parentNodeSkel["parentrepo"]  # Fixme: Need to recursive fixing to parentrepo?
-        if "sortindex" in kwargs:
-            try:
-                skel["sortindex"] = float(kwargs["sortindex"])
-            except:
-                raise errors.PreconditionFailed()
+        if not self.canMove(skelType, skel, parentnode_skel):
+            raise errors.Unauthorized()
+
+        # Check if parentNodeSkel is descendant of the skel
+        walk_skel = parentnode_skel.clone()
+
+        while walk_skel["parententry"]:
+            if walk_skel["parententry"] == skel["key"]:
+                raise errors.NotAcceptable(
+                    f"Invalid move: Entry {key} cannot be moved below its own descendant {parentNode}."
+                )
+
+            walk_skel = walk_skel.read(walk_skel["parententry"])
+
+        old_parentrepo = skel["parentrepo"]
 
         self.onEdit(skelType, skel)
-        skel.write()
+        skel.patch({
+            "parententry": parentnode_skel["key"],
+            "parentrepo": parentnode_skel["parentrepo"],
+            "sortindex": sortindex or time.time()
+        })
         self.onEdited(skelType, skel)
 
-        # Ensure a changed parentRepo get's proagated
-        if currentParentRepo != parentNodeSkel["parentrepo"]:
-            self.updateParentRepo(key, parentNodeSkel["parentrepo"])
+        # Ensure a changed parentRepo get's propagated
+        if old_parentrepo != parentnode_skel["parentrepo"]:
+            self.updateParentRepo(key, parentnode_skel["parentrepo"])
 
-        return self.render.editSuccess(skel)
+        return self.render.render("moveSuccess", skel)
 
     @exposed
     @force_ssl
     @skey(allow_empty=True)
-    def clone(self, skelType: SkelType, key: db.Key | str | int, **kwargs):
+    def clone(self, skelType: SkelType, key: db.Key | str | int, *, bounce: bool = False, **kwargs):
         """
         Clone an existing entry, and render the entry, eventually with error notes on incorrect data.
         Data is taken by any other arguments in *kwargs*.
@@ -767,8 +781,8 @@ class Tree(SkelModule):
         if (
             not kwargs  # no data supplied
             or not current.request.get().isPostRequest  # failure if not using POST-method
-            or not skel.fromClient(kwargs)  # failure on reading into the bones
-            or utils.parse.bool(kwargs.get("bounce"))  # review before changing
+            or not skel.fromClient(kwargs, amend=bounce)  # failure on reading into the bones
+            or bounce  # review before changing
         ):
             return self.render.edit(skel, action="clone")
 

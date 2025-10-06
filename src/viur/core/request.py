@@ -14,11 +14,11 @@ import re
 import time
 import traceback
 import typing as t
+import unicodedata
 from abc import ABC, abstractmethod
 from urllib import parse
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
-import unicodedata
 import webob
 
 from viur.core import current, db, errors, session, utils
@@ -66,17 +66,30 @@ class FetchMetaDataValidator(RequestValidator):
 
     @staticmethod
     def validate(request: 'BrowseHandler') -> t.Optional[tuple[int, str, str]]:
+        """
+            This validator examines the headers "sec-fetch-site",
+            "sec-fetch-mode" and "sec-fetch-dest" as recommended
+            by https://web.dev/fetch-metadata/
+        """
         headers = request.request.headers
-        if not headers.get("sec-fetch-site"):  # These headers are not send by all browsers
-            return None
-        if headers.get('sec-fetch-site') in {"same-origin", "none"}:  # A Request from our site
-            return None
-        if os.environ['GAE_ENV'] == "localdev" and headers.get('sec-fetch-site') == "same-site":
-            # We are accepting a request with same-site only in local dev mode
-            return None
-        if headers.get('sec-fetch-mode') == 'navigate' and not request.isPostRequest \
-            and headers.get('sec-fetch-dest') not in {'object', 'embed'}:  # Incoming navigation GET request
-            return None
+
+        match headers.get("sec-fetch-site"):
+            case None | "same-origin" | "none":
+                # A Request from our site, or browser didn't send "sec-fetch-site"
+                return None
+            case "same-site":
+                # We are accepting a request with same-site only in local dev mode
+                if conf.instance.is_dev_server:
+                    return None
+            case _:
+                # Incoming navigation GET request
+                if (
+                    not request.isPostRequest
+                    and headers.get("sec-fetch-mode") == "navigate"
+                    and headers.get('sec-fetch-dest') not in ("object", "embed")
+                ):
+                    return None
+
         return 403, "Forbidden", "Request rejected due to fetch metadata"
 
 
@@ -133,7 +146,7 @@ class Router:
         self.isPostRequest = self.method == "post"
         self.isSSLConnection = self.request.host_url.lower().startswith("https://")  # We have an encrypted channel
 
-        db.currentDbAccessLog.set(set())
+        db.current_db_access_log.set(set())
 
         # Set context variables
         current.language.set(conf.i18n.default_language)
@@ -179,9 +192,13 @@ class Router:
                     # no q => q = 1
                     locale_q_pairs.append((language.strip(), "1"))
                 else:
-                    locale = language.split(";")[0].strip()
-                    q = language.split(";")[1].split("=")[1]
-                    locale_q_pairs.append((locale, q))
+                    try:
+                        locale = language.split(";")[0].strip()
+                        q = language.split(";")[1].split("=")[1]
+                        locale_q_pairs.append((locale, q))
+                    except IndexError:
+                        continue  # skip language
+            locale_q_pairs.sort(key=lambda pair: pair[1], reverse=True)  # sort by Quality values
             for locale_q_pair in locale_q_pairs:
                 if "-" in locale_q_pair[0]:  # Check for de-DE
                     lang = locale_q_pair[0].split("-")[0]
@@ -189,6 +206,8 @@ class Router:
                     lang = locale_q_pair[0]
                 if lang in conf.i18n.available_languages + list(conf.i18n.language_alias_map.keys()):
                     return lang
+                if lang == "*":  # fallback
+                    return conf.i18n.available_languages[0]
             return None
 
         if not conf.i18n.available_languages:
@@ -259,7 +278,6 @@ class Router:
             elif os.getenv("TASKS_EMULATOR") is not None:
                 self.is_deferred = True
 
-        current.language.set(conf.i18n.default_language)
         # Check if we should process or abort the request
         for validator, reqValidatorResult in [(x, x.validate(self)) for x in self.requestValidators]:
             if reqValidatorResult is not None:
@@ -355,6 +373,9 @@ class Router:
                 raise
             self.response.status = f"{e.status} {e.name}"
             url = e.url
+            url = unquote(url)  # decode first
+            # safe = https://url.spec.whatwg.org/#url-path-segment-string
+            url = quote(url, encoding="utf-8", safe="!$&'()*+,-./:;=?@_~#")  # re-encode all in utf-8
             if url.startswith(('.', '/')):
                 url = str(urljoin(self.request.url, url))
             self.response.headers['Location'] = url
@@ -676,11 +697,9 @@ class Router:
 
         origin = current.request.get().request.headers.get("Origin")
         if not origin:
-            logging.debug(f"Origin header is not set")
             return
 
         # Origin is set --> It's a CORS request
-        logging.debug(f"Got CORS request from {origin=}")
 
         any_origin_allowed = (
             conf.security.cors_origins == "*"

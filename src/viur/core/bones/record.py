@@ -1,7 +1,9 @@
 import json
+import logging
 import typing as t
 
 from viur.core.bones.base import BaseBone, ReadFromClientError, ReadFromClientErrorSeverity
+from viur.core import db, utils, tasks, i18n
 
 if t.TYPE_CHECKING:
     from ..skeleton import SkeletonInstance
@@ -31,7 +33,7 @@ class RecordBone(BaseBone):
         using: 'viur.core.skeleton.RelSkel' = None,
         **kwargs
     ):
-        from viur.core.skeleton import RelSkel
+        from viur.core.skeleton.relskel import RelSkel
         if not issubclass(using, RelSkel):
             raise ValueError("RecordBone requires for valid using-parameter (subclass of viur.core.skeleton.RelSkel)")
 
@@ -64,7 +66,7 @@ class RecordBone(BaseBone):
         if isinstance(value, list) and value:
             value = value[0]
 
-        assert isinstance(value, dict), f"Read something from the datastore thats not a dict: {type(value)}"
+        assert isinstance(value, dict), f"Read {value=} ({type(value)})"
 
         usingSkel = self.using()
         usingSkel.unserialize(value)
@@ -81,7 +83,7 @@ class RecordBone(BaseBone):
         :return: The serialized value.
         """
         if not value:
-            return value
+            return None
 
         return value.serialize(parentIndexed=False)
 
@@ -97,27 +99,52 @@ class RecordBone(BaseBone):
 
     def singleValueFromClient(self, value, skel, bone_name, client_data):
         usingSkel = self.using()
+
         if not usingSkel.fromClient(value):
             usingSkel.errors.append(
-                ReadFromClientError(ReadFromClientErrorSeverity.Invalid, "Incomplete data")
+                ReadFromClientError(
+                    ReadFromClientErrorSeverity.Invalid,
+                    i18n.translate("core.bones.error.incomplete", "Incomplete data"),
+                )
             )
+
         return usingSkel, usingSkel.errors
 
     def postSavedHandler(self, skel, boneName, key) -> None:
         super().postSavedHandler(skel, boneName, key)
-        for idx, lang, value in self.iter_bone_value(skel, boneName):
-            using = self.using()
-            using.unserialize(value)
-            for bone_name, bone in using.items():
-                bone.postSavedHandler(using, bone_name, None)
 
-    def refresh(self, skel, boneName) -> None:
-        super().refresh(skel, boneName)
+        drop_relations_higher = {}
+
         for idx, lang, value in self.iter_bone_value(skel, boneName):
-            using = self.using()
-            using.unserialize(value)
-            for bone_name, bone in using.items():
-                bone.refresh(using, bone_name)
+            if idx > 99:
+                logging.warning("postSavedHandler entry limit maximum reached")
+                drop_relations_higher.clear()
+                break
+
+            for sub_bone_name, bone in value.items():
+                path = ".".join(name for name in (boneName, lang, f"{idx:02}", sub_bone_name) if name)
+                if utils.string.is_prefix(bone.type, "relational"):
+                    drop_relations_higher[sub_bone_name] = path
+
+                bone.postSavedHandler(value, path, key)
+
+        if drop_relations_higher:
+            for viur_src_property in drop_relations_higher.values():
+                query = db.Query("viur-relations") \
+                    .filter("viur_src_kind =", key.kind) \
+                    .filter("src.__key__ =", key) \
+                    .filter("viur_src_property >", viur_src_property)
+
+                logging.debug(f"Delete viur-relations with {query=}")
+                tasks.DeleteEntitiesIter.startIterOnQuery(query)
+
+    def postDeletedHandler(self, skel, boneName, key) -> None:
+        super().postDeletedHandler(skel, boneName, key)
+
+        for idx, lang, value in self.iter_bone_value(skel, boneName):
+            for sub_bone_name, bone in value.items():
+                path = ".".join(name for name in (boneName, lang, f"{idx:02}", sub_bone_name) if name)
+                bone.postDeletedHandler(value, path, key)
 
     def getSearchTags(self, skel: 'viur.core.skeleton.SkeletonInstance', name: str) -> set[str]:
         """
@@ -129,13 +156,14 @@ class RecordBone(BaseBone):
         """
         result = set()
 
-        using_skel_cache = self.using()
-        for idx, lang, value in self.iter_bone_value(skel, name):
+        for _, lang, value in self.iter_bone_value(skel, name):
             if value is None:
                 continue
-            for key, bone in using_skel_cache.items():
+
+            for key, bone in value.items():
                 if not bone.searchable:
                     continue
+
                 for tag in bone.getSearchTags(value, key):
                     result.add(tag)
 
@@ -178,11 +206,11 @@ class RecordBone(BaseBone):
         """
         result = set()
 
-        using_skel_cache = self.using()
-        for idx, lang, value in self.iter_bone_value(skel, name):
+        for _, lang, value in self.iter_bone_value(skel, name):
             if value is None:
                 continue
-            for key, bone in using_skel_cache.items():
+
+            for key, bone in value.items():
                 result |= bone.getReferencedBlobs(value, key)
 
         return result
@@ -198,16 +226,19 @@ class RecordBone(BaseBone):
     def structure(self) -> dict:
         return super().structure() | {
             "format": self.format,
-            "using": self.using().structure()}
+            "using": self.using().structure(),
+        }
+
+    def _atomic_dump(self, value: "SkeletonInstance") -> dict | None:
+        if value is not None:
+            return value.dump()
 
     def refresh(self, skel, bone_name):
-        using_skel = self.using()
-
-        for idx, lang, value in self.iter_bone_value(skel, bone_name):
-            if value is None:
-                continue
-
-            using_skel.unserialize(value)
-
+        for _, _, using_skel in self.iter_bone_value(skel, bone_name):
             for key, bone in using_skel.items():
                 bone.refresh(using_skel, key)
+
+                # When the value (acting as a skel) is marked for deletion, clear it.
+                if using_skel._cascade_deletion is True:
+                    # Unset the Entity, so the skeleton becomes a False truthyness.
+                    using_skel.setEntity(db.Entity())
