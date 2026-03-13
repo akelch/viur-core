@@ -8,21 +8,21 @@ import warnings
 from deprecated.sphinx import deprecated
 
 from viur.core import conf, db, errors, utils
-
-from .meta import BaseSkeleton, MetaSkel, KeyType, _UNDEFINED_KINDNAME
 from . import tasks
+from .meta import BaseSkeleton, MetaSkel, _UNDEFINED_KINDNAME
 from .utils import skeletonByKind
 from ..bones.base import (
     Compute,
     ComputeInterval,
     ComputeMethod,
-    ReadFromClientException,
     ReadFromClientError,
-    ReadFromClientErrorSeverity
+    ReadFromClientErrorSeverity,
+    ReadFromClientException,
 )
-from ..bones.relational import RelationalConsistency
-from ..bones.key import KeyBone
 from ..bones.date import DateBone
+from ..bones.key import KeyBone
+from ..bones.raw import RawBone
+from ..bones.relational import RelationalConsistency
 from ..bones.string import StringBone
 
 if t.TYPE_CHECKING:
@@ -96,6 +96,14 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
     # it gets stored in. Must be kept readOnly to avoid security-issues with add/edit.
     key = KeyBone(
         descr="Key"
+    )
+
+    shortkey = RawBone(
+        descr="Shortkey",
+        compute=Compute(lambda skel: skel["key"].id_or_name if skel["key"] else None),
+        readOnly=True,
+        visible=False,
+        searchable=True,
     )
 
     name = StringBone(
@@ -230,7 +238,7 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
         version="3.7.0",
         reason="Use skel.read() instead of skel.fromDB()",
     )
-    def fromDB(cls, skel: SkeletonInstance, key: KeyType) -> bool:
+    def fromDB(cls, skel: SkeletonInstance, key: db.KeyType) -> bool:
         """
         Deprecated function, replaced by Skeleton.read().
         """
@@ -240,7 +248,7 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
     def read(
         cls,
         skel: SkeletonInstance,
-        key: t.Optional[KeyType] = None,
+        key: t.Optional[db.KeyType] = None,
         *,
         create: bool | dict | t.Callable[[SkeletonInstance], None] = False,
         _check_legacy: bool = True
@@ -282,13 +290,14 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
         elif create in (False, None):
             return None
         elif isinstance(create, dict):
-            if create and not skel.fromClient(create, amend=True):
+            if create and not skel.fromClient(create, amend=True, ignore=()):
                 raise ReadFromClientException(skel.errors)
         elif callable(create):
             create(skel)
         elif create is not True:
             raise ValueError("'create' must either be dict, a callable or True.")
 
+        skel["key"] = db_key
         return skel.write()
 
     @classmethod
@@ -315,7 +324,7 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
     def write(
         cls,
         skel: SkeletonInstance,
-        key: t.Optional[KeyType] = None,
+        key: t.Optional[db.KeyType] = None,
         *,
         update_relations: bool = True,
         _check_legacy: bool = True,
@@ -341,6 +350,7 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
                 warnings.simplefilter("ignore", DeprecationWarning)
                 return cls.toDB(skel, update_relations=update_relations)
 
+        # FIXME: This check is incomplete as long it does nt check the entire tree!
         assert skel.renderPreparation is None, "Cannot modify values while rendering"
 
         def __txn_write(write_skel):
@@ -502,8 +512,10 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
 
             skel.dbEntity["viur"].setdefault("viurActiveSeoKeys", [])
             for language, seo_key in last_set_seo_keys.items():
-                if skel.dbEntity["viur"]["viurCurrentSeoKeys"][language] not in \
-                        skel.dbEntity["viur"]["viurActiveSeoKeys"]:
+                if (
+                    skel.dbEntity["viur"]["viurCurrentSeoKeys"][language]
+                    not in skel.dbEntity["viur"]["viurActiveSeoKeys"]
+                ):
                     # Ensure the current, active seo key is in the list of all seo keys
                     skel.dbEntity["viur"]["viurActiveSeoKeys"].insert(0, seo_key)
             if str(skel.dbEntity.key.id_or_name) not in skel.dbEntity["viur"]["viurActiveSeoKeys"]:
@@ -615,7 +627,7 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
         return skel
 
     @classmethod
-    def delete(cls, skel: SkeletonInstance, key: t.Optional[KeyType] = None) -> None:
+    def delete(cls, skel: SkeletonInstance, key: t.Optional[db.KeyType] = None) -> None:
         """
             Deletes the entity associated with the current Skeleton from the data store.
 
@@ -711,6 +723,7 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
         create: t.Optional[bool | dict | t.Callable[[SkeletonInstance], None]] = None,
         update_relations: bool = True,
         ignore: t.Optional[t.Iterable[str]] = (),
+        internal: bool = True,
         retry: int = 0,
     ) -> SkeletonInstance:
         """
@@ -736,6 +749,7 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
         :param update_relations: Trigger update relations task on success. Defaults to False.
         :param ignore: optional list of bones to be ignored from values; Defaults to an empty list,
             so that all bones are accepted (even read-only ones, as skel.patch() is being used internally)
+        :param internal: Internal patch does ignore any NotSet and Empty errors that may raise in skel.fromClient()
         :param retry: On RuntimeError, retry for this amount of times. - DEPRECATED!
 
         If the function does not raise an Exception, all went well.
@@ -779,8 +793,20 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
 
             # Set values
             if isinstance(values, dict):
-                if values and not skel.fromClient(values, amend=True, ignore=ignore):
+                if values and not skel.fromClient(values, amend=True, ignore=ignore) and not internal:
                     raise ReadFromClientException(skel.errors)
+
+                # In case we're in internal-mode, only raise fatal errors.
+                if skel.errors and internal:
+                    for error in skel.errors:
+                        if error.severity in (
+                                ReadFromClientErrorSeverity.Invalid,
+                                ReadFromClientErrorSeverity.InvalidatesOther,
+                        ):
+                            raise ReadFromClientException(skel.errors)
+
+                    # otherwise, ignore any reported errors
+                    skel.errors.clear()
 
                 # Special-feature: "+" and "-" prefix for simple calculations
                 # TODO: This can maybe integrated into skel.fromClient() later...

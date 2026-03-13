@@ -2,6 +2,73 @@
 
 This file documents any relevant changes done to ViUR-core since version 3.
 
+## [3.8.19]
+
+- fix: Adding further cases for deprecation handling (#1644)
+- fix: Unescape file name for `serving_url` generation (#1643)
+- fix: `renderSkelValues` and `renderBoneValue` for backward compatibility (#1641)
+
+## [3.8.18]
+
+- refactor: Provide `db.KeyType` for better integration
+
+## [3.8.17]
+
+- fix: `utils` replace map (#1632)
+- fix: Call `Tree.canAdd` with `SkeletonInstance` in `Tree.clone` (#1631)
+- fix: Call postSavedHandler on UsingSkel (RelSkel) (#1637)
+- fix: switch from coverage-badge to genbadge (formerly #1629)
+- fix: viur-migrate (#1634)
+- refactor: Use `KeyType` for `isinstance` checks (#1638)
+
+## [3.8.16]
+
+- fix: Propagate `@property` from Skeleton to `SkeletonInstance` that belongs to a `RefSkel` + reset `renderPreparation` (#1623)
+- fix: `UserPassword.pwrecover` should strip the recovery_key (#1621)
+- fix: Use new vi-admin code-feature with syntax highlighting (#1615)
+
+## [3.8.15]
+
+- fix: `ComputeMethod.Always` fails when skeleton is being rendered (#1614)
+
+## [3.8.14]
+
+- fix: No exception raise on compute attempt on deleted RefSkel (#1608)
+
+## [3.8.13]
+
+- fix: `RelationalBone.refresh()` should write a clean dbEntity (#1609)
+- fix: Raise error 400 on broken UTF-8 URL request (#1610)
+
+## [3.8.12]
+
+- fix: `skel.read()` with `create`-mode totally broken (#1607)
+- fix: `KeyBone.serialize()` didn't evaluate compute-OnWrite (#1606)
+
+## [3.8.11]
+
+- feat: Provide a `shortkey` bone with each Skeleton (#1598)
+- fix: `BaseBone.dump()` uses unused variable `ret` (#1603)
+- fix: `ComputeMethod.Always/Lifetime` on unwritten Skeleton (#1605)
+- fix: `FileBone.postSavedHandler()` cannot be used outside of request (#1597)
+- fix: `RecordBone.postDeletedHandler()`: Check if the index is None (#1604)
+
+## [3.8.10]
+
+- fix: RawBone looses its value when invalid (#1595)
+
+## [3.8.9]
+
+- fix: `Tree._clone_recursive` internal call (#1593)
+- fix: `RecordBone(multiple=False)` raise exception (#1591)
+
+## [3.8.8]
+
+- doc: Fix seo_language_map in docstring
+- feat: `skel.patch()` with internal-mode default (#1587)
+- feat: Check `conf.valid_application_ids` with `fnmatch` and generally make it optional (#1590)
+- revert: Change regarding `self.onLogin()` in ViUR3 (#1584)
+
 ## [3.8.7]
 
 - fix: Avoid compute bones when the skel in deleted in a cascade (#1581)
